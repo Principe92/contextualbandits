@@ -14,11 +14,13 @@ from scipy.linalg.cython_blas cimport (
 from scipy.linalg.cython_lapack cimport (
     dposv as tposv,
     dpotri as tpotri,
-    dpotrf as tpotrf
+    dpotrf as tpotrf,
+    dsyev as tsyev
     )
+from libc.math cimport fabs as fabs_t
 
-ctypedef double realtp
-C_realtp = ctypes.c_double
+ctypedef double real_t
+C_real_t = ctypes.c_double
 
 
 include "linreg_untyped.pxi"

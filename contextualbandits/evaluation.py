@@ -10,7 +10,7 @@ __all__ = ["evaluateRejectionSampling", "evaluateDoublyRobust",
 
 def evaluateRejectionSampling(policy, X, a, r, online=True, partial_fit=False,
                               start_point_online='random', random_state=1,
-                              update_freq=10):
+                              batch_size=10):
     """
     Evaluate a policy using rejection sampling on test data.
     
@@ -45,8 +45,11 @@ def evaluateRejectionSampling(policy, X, a, r, online=True, partial_fit=False,
         object (from NumPy) from which to draw an integer, or a ``Generator``
         object (from NumPy), which will be used directly.
         This is only used when passing ``start_point_online='random'``.
-    update_freq : int
-        After how many rounds to refit the policy being evaluated.
+    batch_size : int
+        Size of batches of data to take for making predictions and adding
+        observations to the history. Note that usually most of the samples
+        are rejected, thus the actual size of the batches to which the models
+        are refit are usually smaller than this number.
         Only used when passing ``online=True``.
         
     Returns
@@ -76,41 +79,49 @@ def evaluateRejectionSampling(policy, X, a, r, online=True, partial_fit=False,
         match=pred==a
         return (np.mean(r[match]), match.sum())
     else:
-        ### TODO: this for loop approach is too slow, should instead have a
-        ### forward window to make predictions in batches and then backtrack
-        ### at the time a refit is due.
+        new_indices = np.concatenate((np.arange(start_point_online, X.shape[0]), np.arange(0, start_point_online)))
+        X,a,r = X[new_indices], a[new_indices], r[new_indices]
+        
         cum_r=0
         cum_n=0
         ix_chosen=list()
         policy.fit(X[:0], a[:0], r[:0])
-        for i in range(start_point_online, X.shape[0]):
-            obs=X[i].reshape((1,-1))
-            would_choose=policy.predict(obs)[0]
-            if would_choose==a[i]:
-                cum_r+=r[i]
-                cum_n+=1
-                ix_chosen.append(i)
-                if (cum_n%update_freq)==0:
-                    if not partial_fit:
-                        ix_fit=np.array(ix_chosen)
-                        policy.fit(X[ix_fit], a[ix_fit], r[ix_fit])
-                    else:
-                        ix_fit = np.array(ix_chosen[:-(update_freq+1):-1])
-                        policy.partial_fit(X[ix_fit], a[ix_fit], r[ix_fit])
-        for i in range(0, start_point_online):
-            obs=X[i].reshape(1,-1)
-            would_choose=policy.predict(obs)[0]
-            if would_choose==a[i]:
-                cum_r+=r[i]
-                cum_n+=1
-                ix_chosen.append(i)
-                if (cum_n%update_freq)==0:
-                    if not partial_fit:
-                        ix_fit=np.array(ix_chosen)
-                        policy.fit(X[ix_fit], a[ix_fit], r[ix_fit])
-                    else:
-                        ix_fit = np.array(ix_chosen)[:-(update_freq+1):-1]
-                        policy.partial_fit(X[ix_fit], a[ix_fit], r[ix_fit])
+        
+        try:
+            from tqdm import tqdm as looper
+        except:
+            def looper(iterator, desc=None):
+                return(iterator)
+                
+        for i in looper(range(X.shape[0]//batch_size+1), desc='Batches'):
+            if batch_size != 1:
+                batch_ix = np.arange(i*batch_size, min((i+1)*batch_size, X.shape[0]))
+            else:
+                batch_ix = np.array([i], dtype=int)
+            if (batch_ix.shape[0] == 0) or (batch_ix[0] >= X.shape[0]):
+            # Occurs when X.shape[0]/batch_size is an integer
+                break
+
+            X_batch, a_batch, r_batch = X[batch_ix], a[batch_ix], r[batch_ix]
+            
+            would_choose=policy.predict(X_batch)
+            in_sample = (would_choose==a_batch)
+            n_take = in_sample.sum()
+            
+            if n_take:
+                cum_r += r_batch[in_sample].sum()
+                cum_n += n_take
+                ix_chosen_this_batch = np.where(in_sample)[0]
+                if batch_size != 1:
+                    ix_chosen.extend(i*batch_size + ix_chosen_this_batch)
+                else:
+                    ix_chosen.append(i)
+                
+                if not partial_fit:
+                    ix_fit=np.array(ix_chosen).astype(int)
+                    policy.fit(X[ix_fit], a[ix_fit], r[ix_fit])
+                else:
+                    policy.partial_fit(X_batch[ix_chosen_this_batch], a_batch[ix_chosen_this_batch], r_batch[ix_chosen_this_batch])
         if cum_n==0:
             raise ValueError("Rejection sampling couldn't obtain any matching samples.")
         return (cum_r/cum_n, cum_n)

@@ -137,6 +137,16 @@ def _check_beta_prior(beta_prior, nchoices, for_ucb=False):
             out = ( (3.0 / np.log2(nchoices), 4.0), 2 )
     elif beta_prior is None:
         out = ((1.0,1.0), 0)
+    elif isinstance(beta_prior, list):
+        assert len(beta_prior) == nchoices
+        for prior in beta_prior:
+            if ( (len(prior) != 2)
+                or (len(prior[0]) != 2)
+                or (prior[0][0] <= 0.) or (prior[0][1] <= 0.)
+                or (prior[1] < 0)
+                ):
+                raise ValueError("Invalid value for 'beta_prior'.")
+        out = beta_prior
     else:
         assert len(beta_prior) == 2
         assert len(beta_prior[0]) == 2
@@ -147,13 +157,26 @@ def _check_beta_prior(beta_prior, nchoices, for_ucb=False):
         out = beta_prior
     return out
 
-def _check_smoothing(smoothing):
+def _check_smoothing(smoothing, nchoices):
     if smoothing is None:
         return None
-    assert len(smoothing) >= 2
-    assert (smoothing[0] >= 0) & (smoothing[1] >= 0)
-    assert smoothing[1] >= smoothing[0]
-    return float(smoothing[0]), float(smoothing[1])
+    if not (isinstance(smoothing, np.ndarray) or len(smoothing) == nchoices):
+        assert len(smoothing) >= 2
+        assert (smoothing[0] >= 0) & (smoothing[1] > 0)
+        assert smoothing[1] >= smoothing[0]
+        return float(smoothing[0]), float(smoothing[1])
+    else:
+        if (nchoices == 2) and (not isinstance(smoothing, np.ndarray)):
+            if smoothing[0].__class__.__name__ not in ("tuple", "list", "Series", "NoneType"):
+                return _check_smoothing(smoothing, 3)
+        if not isinstance(smoothing, np.ndarray):
+            smoothing = np.array(smoothing).T
+        if smoothing.shape[1] != nchoices:
+            raise ValueError("Number of entries in 'smoothing' doesn't match with 'nchoices'.")
+        if smoothing.shape[0] != 2:
+            raise ValueError("'smoothing' should have only tuples of length 2.")
+        return smoothing
+
 
 
 def _check_fit_input(X, a, r, choice_names = None):
@@ -195,35 +218,14 @@ def _check_1d_inp(y):
     assert len(y.shape) == 1
     return y
 
-def _check_bay_inp(method, n_iter, n_samples):
-    assert method in ['advi','nuts', 'metropolis']
-    if n_iter == 'auto':
-        if method == 'nuts':
-            n_iter = 10000
-        elif method == 'metropolis':
-            n_iter = 25000
-        else:
-            n_iter = 5000
-    assert n_iter > 0
-    if isinstance(n_iter, float):
-        n_iter = int(n_iter)
-    assert isinstance(n_iter, int)
-
-    assert n_samples > 0
-    if isinstance(n_samples, float):
-        n_samples = int(n_samples)
-    assert isinstance(n_samples, int)
-
-    return n_iter, n_samples
-
 def _check_refit_inp(refit_buffer_X, refit_buffer_r, refit_buffer):
-    if (refit_buffer_X is not None) or (refit_buffer_y is not None):
+    if (refit_buffer_X is not None) or (refit_buffer_r is not None):
         if not refit_buffer:
             msg  = "Can only pass 'refit_buffer_X' and 'refit_buffer_r' "
             msg += "when using 'refit_buffer'."
             raise ValueError(msg)
-        if (refit_buffer_X is None) or (refit_buffer_y is None):
-            msg  = "'refit_buffer_X' and 'refit_buffer_y "
+        if (refit_buffer_X is None) or (refit_buffer_r is None):
+            msg  = "'refit_buffer_X' and 'refit_buffer_r "
             msg += "must be passed in conjunction."
             raise ValueError(msg)
         refit_buffer_X = _check_X_input(refit_buffer_X)
@@ -304,7 +306,10 @@ def _gen_zero_norms(X, n_pos, n_neg):
 
 def _apply_smoothing(preds, smoothing, counts, add_noise, random_state):
     if (smoothing is not None) and (counts is not None):
-        preds[:, :] = (preds * counts + smoothing[0]) / (counts + smoothing[1])
+        if not isinstance(smoothing, np.ndarray):
+            preds[:, :] = (preds * counts + smoothing[0]) / (counts + smoothing[1])
+        else:
+            preds[:, :] = (preds * counts + smoothing[0].reshape((1,-1))) / (counts + smoothing[1].reshape((1,-1)))
         if add_noise:
             preds[:, :] += random_state.uniform(low=0., high=1e-12, size=preds.shape)
     return None
@@ -337,6 +342,44 @@ def _apply_softmax(x):
     x[:, :] = x / x.sum(axis=1).reshape((-1, 1))
     x[x > 1.] = 1.
     return None
+
+def _beta_prior_by_arm(beta_prior, nchoices):
+    ### Outputs entries [a_i],[b_i],[n_i]
+    ### From a tuple ((a,b) n)
+    ### Or from a list of such tuples
+    if beta_prior is None:
+        return (
+            np.array([None] * nchoices),
+            np.array([None] * nchoices),
+            np.zeros(nchoices)
+        )
+    elif isinstance(beta_prior, tuple):
+        return (
+            np.array([beta_prior[0][0]] * nchoices),
+            np.array([beta_prior[0][1]] * nchoices),
+            np.array([beta_prior[1]]    * nchoices)
+        )
+    elif isinstance(beta_prior, list):
+        return (
+            np.array([prior[0][0] for prior in beta_prior]),
+            np.array([prior[0][1] for prior in beta_prior]),
+            np.array([prior[1]    for prior in beta_prior])
+        )
+    else:
+        raise ValueError(_unexpected_err_msg)
+
+def is_from_this_module(base):
+    return (isinstance(base, _BootstrappedClassifierBase) or
+            isinstance(base, _LinUCB_n_TS_single) or
+            isinstance(base, _LogisticUCB_n_TS_single) or
+            isinstance(base, _TreeUCB_n_TS_single))
+
+def _make_robust_base(base, partialfit):
+    if 'predict_proba' not in dir(base):
+        base = _convert_decision_function_w_sigmoid(base)
+    if partialfit:
+        base = _add_method_predict_robust(base)
+    return base
 
 class _FixedPredictor:
     def __init__(self):
@@ -661,13 +704,14 @@ class _RefitBuffer:
 class _OneVsRest:
     def __init__(self, base,
                  X, a, r, n,
-                 thr, alpha, beta,
+                 alpha, beta, thr,
                  random_state,
                  smooth=False, noise_to_smooth=True, assume_un=False,
                  partialfit=False, refit_buffer=0, deep_copy=False,
                  force_fit=False, force_counters=False,
                  prev_ovr=None, warm=False,
                  force_unfit_predict=False,
+                 arms_to_update=None,
                  njobs=1):
         self.n = n
         self.smooth = smooth
@@ -682,7 +726,7 @@ class _OneVsRest:
         self.deep_copy = deep_copy
         self.partialfit = bool(partialfit)
         self.force_counters = bool(force_counters)
-        if (self.force_counters) or (self.thr > 0 and not self.force_fit):
+        if (self.force_counters) or (self.thr[0] and not self.force_fit):
             ## in case it has beta prior, keeps track of the counters until no longer needed
             self.alpha = alpha
             self.beta = beta
@@ -715,16 +759,10 @@ class _OneVsRest:
             self.buffer = None
 
         if not isinstance(base, list):
-            if 'predict_proba' not in dir(base):
-                base = _convert_decision_function_w_sigmoid(base)
-            if partialfit:
-                base = _add_method_predict_robust(base)
+            base = _make_robust_base(base, self.partialfit)
         else:
             for alg in range(len(base)):
-                if 'predict_proba' not in dir(base[alg]):
-                    base[alg] = _convert_decision_function_w_sigmoid(base[alg])
-                if partialfit:
-                    base[alg] = _add_method_predict_robust(base[alg])
+                base[alg] = _make_robust_base(base[alg], self.partialfit)
         
         if isinstance(base, list):
             self.base = None
@@ -738,56 +776,71 @@ class _OneVsRest:
                         self.algos[choice] = deepcopy(base)
                         if is_from_this_module(base):
                             self.algos[choice].random_state = self.rng_arm[choice]
-            else: 
+            else:
                 self.algos = [deepcopy(base) for choice in range(self.n)]
                 if is_from_this_module(base):
                     for choice in range(self.n):
                         self.algos[choice].random_state = self.rng_arm[choice]
+                    if isinstance(base, _TreeUCB_n_TS_single) and (base.ts):
+                        for choice in range(self.n):
+                            self.algos[choice]._set_prior(self.alpha[choice], self.beta[choice])
 
         if self.partialfit:
             self.partial_fit(X, a, r)
         else:
             Parallel(n_jobs=self.njobs, verbose=0, require="sharedmem")\
                     (delayed(self._full_fit_single)\
-                            (choice, X, a, r) for choice in range(self.n))
+                            (choice, X, a, r, arms_to_update) for choice in range(self.n))
 
-    def _drop_arm(self, drop_ix):
+    def _drop_arm(self, drop_ix, alpha, beta, thr):
         del self.algos[drop_ix]
         del self.rng_arm[drop_ix]
         if self.buffer is not None:
-            del sef.buffer[drop_ix]
+            del self.buffer[drop_ix]
         self.n -= 1
+        self.thr = thr
+
         if self.smooth is not None:
             self.counters = self.counters[:, np.arange(self.counters.shape[1]) != drop_ix]
-        if (self.force_counters) or (self.thr > 0 and not self.force_fit):
+        if (self.force_counters) or (self.thr[0] and not self.force_fit):
             self.beta_counters = self.beta_counters[:, np.arange(self.beta_counters.shape[1]) != drop_ix]
+            self.alpha = alpha
+            self.beta = beta
 
     def _spawn_arm(self, fitted_classifier = None, n_w_rew = 0, n_wo_rew = 0,
-                   buffer_X = None, buffer_y = None):
+                   buffer_X = None, buffer_y = None,
+                   beta_prior_by_arm = None):
+        alpha = beta_prior_by_arm[0][-1]
+        beta = beta_prior_by_arm[1][-1]
+        thr = beta_prior_by_arm[2][-1]
+        self.thr = beta_prior_by_arm[2]
         self.n += 1
         self.rng_arm.append(self.random_state if (self.random_state == np.random) else \
                             _check_random_state(
                                 self.random_state.integers(np.iinfo(np.int32).max) + 1))
         if self.smooth is not None:
             self.counters = np.c_[self.counters, np.array([n_w_rew + n_wo_rew]).reshape((1, 1)).astype(self.counters.dtype)]
-        if (self.force_counters) or (self.thr > 0 and not self.force_fit):
-            new_beta_col = np.array([0 if (n_w_rew + n_wo_rew) < self.thr else 1, self.alpha + n_w_rew, self.beta + n_wo_rew]).reshape((3, 1)).astype(self.beta_counters.dtype)
+        if (self.force_counters) or (thr and not self.force_fit):
+            new_beta_col = \
+                np.array([0 if (n_w_rew + n_wo_rew) < thr else 1,
+                          n_w_rew, n_wo_rew])\
+                    .reshape((3, 1)).astype(self.beta_counters.dtype)
             self.beta_counters = np.c_[self.beta_counters, new_beta_col]
+            self.alpha = beta_prior_by_arm[0]
+            self.beta  = beta_prior_by_arm[1]
         if fitted_classifier is not None:
-            if 'predict_proba' not in dir(fitted_classifier):
-                fitted_classifier = _convert_decision_function_w_sigmoid(fitted_classifier)
-            if partialfit:
-                fitted_classifier = _add_method_predict_robust(fitted_classifier)
+            fitted_classifier = _make_robust_base(fitted_classifier, self.partialfit)
             self.algos.append(fitted_classifier)
         else:
             if self.force_fit or self.partialfit:
                 if self.base is None:
+                    ### Note: this conditioned was already checked outside of _OneVsRest
                     raise ValueError("Must provide a classifier when initializing with different classifiers per arm.")
                 self.algos.append( deepcopy(self.base) )
             else:
-                if (self.force_counters) or (self.thr > 0 and not self.force_fit):
-                    self.algos.append(_BetaPredictor(self.beta_counters[:, -1][1],
-                                                     self.beta_counters[:, -1][2],
+                if (self.force_counters) or (thr and not self.force_fit):
+                    self.algos.append(_BetaPredictor(self.beta_counters[:, -1][1] + alpha,
+                                                     self.beta_counters[:, -1][2] + beta,
                                                      self.rng_arm[-1]))
                 else:
                     self.algos.append(_ZeroPredictor())
@@ -802,18 +855,20 @@ class _OneVsRest:
             n_pos = (yclass > 0.).sum()
             self.beta_counters[1, choice] += n_pos
             self.beta_counters[2, choice] += yclass.shape[0] - n_pos
-            if (self.beta_counters[1, choice] > self.thr) and (self.beta_counters[2, choice] > self.thr):
+            if (self.beta_counters[1, choice] > self.thr[choice]) and (self.beta_counters[2, choice] > self.thr[choice]):
                 self.beta_counters[0, choice] = 1
 
-    def _full_fit_single(self, choice, X, a, r):
+    ### TODO: refactor this to make better usage of 'arms_to_update' and avoid
+    ### having to use shared memory
+    def _full_fit_single(self, choice, X, a, r, arms_to_update):
         yclass, this_choice = self._filter_arm_data(X, a, r, choice)
         n_pos = (yclass > 0.).sum()
         if self.smooth is not None:
             self.counters[0, choice] += yclass.shape[0]
-        if (n_pos < self.thr) or ((yclass.shape[0] - n_pos) < self.thr):
+        if (n_pos < self.thr[choice]) or ((yclass.shape[0] - n_pos) < self.thr[choice]):
             if not self.force_fit:
-                self.algos[choice] = _BetaPredictor(self.alpha + n_pos,
-                                                    self.beta + yclass.shape[0] - n_pos,
+                self.algos[choice] = _BetaPredictor(self.alpha[choice] + n_pos,
+                                                    self.beta[choice] + yclass.shape[0] - n_pos,
                                                     self.rng_arm[choice])
                 return None
         if n_pos == 0:
@@ -824,10 +879,12 @@ class _OneVsRest:
             if not self.force_fit:
                 self.algos[choice] = _OnePredictor()
                 return None
-        xclass = X[this_choice, :]
-        self.algos[choice].fit(xclass, yclass)
 
-        if (self.force_counters) or (self.thr > 0 and not self.force_fit):
+        if (arms_to_update is None) or (choice in arms_to_update):
+            xclass = X[this_choice, :]
+            self.algos[choice].fit(xclass, yclass)
+
+        if (self.force_counters) or (self.thr[choice] > 0 and not self.force_fit):
             self._update_beta_counters(yclass, choice)
 
 
@@ -885,11 +942,11 @@ class _OneVsRest:
     def _decision_function_single(self, choice, X, preds, depth=2):
         ## case when using partial_fit and need beta predictions
         if ((self.partialfit or self.force_fit) and
-            (self.thr > 0) and (not self.force_unfit_predict)):
+            (self.thr[choice] > 0) and (not self.force_unfit_predict)):
             if self.beta_counters[0, choice] == 0:
                 preds[:, choice] = \
-                    self.rng_arm[choice].beta(self.alpha + self.beta_counters[1, choice],
-                                              self.beta  + self.beta_counters[2, choice],
+                    self.rng_arm[choice].beta(self.alpha[choice] + self.beta_counters[1, choice],
+                                              self.beta[choice]  + self.beta_counters[2, choice],
                                               size=preds.shape[0])
                 return None
 
@@ -942,7 +999,7 @@ class _OneVsRest:
             return True
         if isinstance(self.algos[choice], _FixedPredictor):
             return False
-        if not bool(self.thr):
+        if not bool(self.thr[choice]):
             return True
         try:
             return bool(self.beta_counters[0, choice])
@@ -976,22 +1033,36 @@ class _OneVsRest:
 
 class _LinUCB_n_TS_single:
     def __init__(self, alpha=1.0, lambda_=1.0, fit_intercept=True,
-                 use_float=True, method="sm", ts=False,
-                 sample_unique=False, random_state=1):
-        self.alpha = alpha
+                 use_float=True, method="sm", ts=False, ts_from_ci=False,
+                 sample_unique=False, n_presampled=None, random_state=1):
+        self._alpha = alpha
         self.lambda_ = lambda_
         self.fit_intercept = fit_intercept
         self.use_float = use_float
         self.method = method
         self.ts = ts
+        self.ts_from_ci = ts_from_ci
         self.sample_unique = bool(sample_unique)
+        self.n_presampled = n_presampled
         self.random_state = _check_random_state(random_state)
         self.is_fitted = False
         self.model = LinearRegression(lambda_=self.lambda_,
                                       fit_intercept=self.fit_intercept,
                                       method=self.method,
                                       use_float=self.use_float,
-                                      calc_inv=True)
+                                      precompute_ts=(self.ts) and (not self.ts_from_ci),
+                                      precompute_ts_multiplier=self.alpha,
+                                      n_presampled=n_presampled,
+                                      calc_inv= not ( (self.ts) and (not self.ts_from_ci) ))
+
+    @property
+    def alpha(self):
+        return self._alpha
+
+    @alpha.setter
+    def alpha(self, value):
+        self._alpha = alpha
+        self.model.precompute_ts_multiplier = alpha
 
     def fit(self, X, y):
         if X.shape[0]:
@@ -1012,8 +1083,13 @@ class _LinUCB_n_TS_single:
             return self.model.predict_ucb(X, self.alpha, add_unfit_noise=True,
                                           random_state=self.random_state)
         else:
-            return self.model.predict_thompson(X, self.alpha, self.sample_unique,
-                                               self.random_state)
+            if not self.ts_from_ci:
+                return self.model.predict_thompson(X, self.alpha, self.sample_unique,
+                                                   self.random_state)
+            else:
+                rnd = self.random_state.normal(size=X.shape[0], scale=self.alpha)
+                return self.model.predict_ucb(X, rnd, add_unfit_noise=True,
+                                              random_state=self.random_state)
 
     def exploit(self, X):
         if not self.is_fitted:
@@ -1022,7 +1098,9 @@ class _LinUCB_n_TS_single:
 
 class _LogisticUCB_n_TS_single:
     def __init__(self, lambda_=1., fit_intercept=True, alpha=0.95,
-                 m=1.0, ts=False, ts_from_ci=True, sample_unique=False, random_state=1):
+                 m=1.0, ts=False, ts_from_ci=True,
+                 sample_unique=False, n_presampled=None,
+                 random_state=1):
         self.conf_coef = alpha
         self.m = m
         self.fit_intercept = fit_intercept
@@ -1031,6 +1109,7 @@ class _LogisticUCB_n_TS_single:
         self.ts_from_ci = ts_from_ci
         self.warm_start = True
         self.sample_unique = bool(sample_unique)
+        self.n_presampled = n_presampled
         self.random_state = _check_random_state(random_state)
         self.is_fitted = False
         self.model = LogisticRegression(C=1./lambda_, penalty="l2",
@@ -1038,6 +1117,7 @@ class _LogisticUCB_n_TS_single:
                                         solver='lbfgs', max_iter=15000,
                                         warm_start=True)
         self.Sigma = np.empty((0,0), dtype=np.float64)
+        self.EigMultiplier = np.empty((0,0), dtype=np.float64)
 
     def __setattr__(self, name, value):
         if (name == "conf_coef"):
@@ -1065,7 +1145,26 @@ class _LogisticUCB_n_TS_single:
             add_bias=self.fit_intercept,
             overwrite=1
         )
-        _matrix_inv_symm(self.Sigma, self.lambda_)
+        ### For TS-coef, 'Sigma' will be a transformation on the eigenvalues of the
+        ### inverse of the variance-covariance of the predictors,
+        ### For UCB and TS-ci, will be the variance-covariance matrix of the predictors
+        if (self.ts) and (not self.ts_from_ci):
+            self.EigMultiplier, ignored, ignored_ = \
+                _wrapper_double.get_mvnorm_multiplier(self.Sigma, self.m, True, True)
+            if self.n_presampled is not None:
+                if self.fit_intercept:
+                    coef = np.r_[self.model.coef_.reshape(-1), self.model.intercept_]
+                else:
+                    coef = self.model.coef_.reshape(-1)
+                self.coef_presampled = \
+                    _wrapper_double.mvnorm_from_Eig(coef,
+                                                    self.EigMultiplier,
+                                                    self.n_presampled,
+                                                    self.random_state)
+                self.EigMultiplier = np.empty((0,0), dtype=np.float64)
+                self.Sigma = np.empty((0,0), dtype=np.float64)
+        else:
+            _matrix_inv_symm(self.Sigma, self.lambda_)
         self.is_fitted = True
 
     def _process_X(self, X):
@@ -1096,7 +1195,7 @@ class _LogisticUCB_n_TS_single:
             pred = self.model.decision_function(X)
             X, Xcsr = self._process_X(X)
             se_sq = _wrapper_double.x_A_x_batch(X, self.Sigma, Xcsr, self.fit_intercept, 1)
-            pred[:] += self.random_state.normal(size=X.shape[0]) * np.sqrt(se_sq.reshape(-1))
+            pred[:] += self.random_state.normal(size=X.shape[0], scale=self.m) * np.sqrt(se_sq.reshape(-1))
             _apply_sigmoid(pred)
             return pred
 
@@ -1107,33 +1206,40 @@ class _LogisticUCB_n_TS_single:
             else:
                 coef = self.model.coef_.reshape(-1)
 
-            tol = 1e-20
-            if np.linalg.det(self.Sigma) >= tol:
-                cov = self.Sigma
-            else:
-                cov = self.Sigma.copy()
-                n = cov.shape[1]
-                for i in range(10):
-                    cov[np.arange(n), np.arange(n)] += 1e-1
-                    if np.linalg.det(cov) >= tol:
-                        break
-
-            if self.sample_unique:
-                coef = self.random_state.multivariate_normal(mean=coef,
-                                                             cov=self.m * cov,
-                                                             size=X.shape[0])
+            if self.n_presampled is not None:
+                n_available = self.coef_presampled.shape[0]
+                n_take = X.shape[0]
+                ix_take = self.random_state.choice(n_available, size=n_take, replace=True)
+                coef = self.coef_presampled[ix_take]
                 if not issparse(X):
-                    pred = np.einsum("ij,ij->i", X, coef[:,:X.shape[1]])
+                    pred = np.einsum("ij,ij->i", X, coef[:, :X.shape[1]])
                 else:
                     pred = np.array(X
-                                    .multiply(coef[:,:X.shape[1]])
+                                    .multiply(coef[:, :X.shape[1]])
                                     .sum(axis=1))\
                                     .reshape(-1)
                 if self.fit_intercept:
                     pred[:] += coef[:,-1]
+            elif self.sample_unique:
+                coef = _wrapper_double.mvnorm_from_Eig(coef,
+                                                       self.EigMultiplier,
+                                                       X.shape[0],
+                                                       self.random_state)
+                if not issparse(X):
+                    pred = np.einsum("ij,ij->i", X, coef[:, :X.shape[1]])
+                else:
+                    pred = np.array(X
+                                    .multiply(coef[:, :X.shape[1]])
+                                    .sum(axis=1))\
+                                    .reshape(-1)
+                if self.fit_intercept:
+                    pred[:] += coef[:, -1]
             else:
-                coef = self.random_state.multivariate_normal(mean=coef,
-                                                             cov=self.m * cov)
+                coef = _wrapper_double.mvnorm_from_Eig(coef,
+                                                       self.EigMultiplier,
+                                                       1,
+                                                       self.random_state)
+                coef = coef.reshape(-1)
                 pred = X.dot(coef[:X.shape[1]])
                 if not isinstance(pred, np.ndarray):
                     pred = np.array(pred).reshape(-1)
@@ -1171,18 +1277,22 @@ class _LogisticUCB_n_TS_single:
 class _TreeUCB_n_TS_single:
     def __init__(self, beta_prior=(1,1), ts=False, alpha=0.8, random_state=None,
                  *args, **kwargs):
-        self.beta_prior = beta_prior
+        self.beta_prior = beta_prior ## will be changed later in _OneVsRest
         self.random_state = random_state
         self.conf_coef = alpha
         self.ts = bool(ts)
         self.model = DecisionTreeClassifier(*args, **kwargs)
         self.is_fitted = False
-        self.aux_beta = (beta_prior[0], beta_prior[1])
+        self.aux_beta = (beta_prior[0], beta_prior[1]) ## changed later
 
     def __setattr__(self, name, value):
         if (name == "conf_coef"):
             value = norm_dist.ppf(value / 100.)
         super().__setattr__(name, value)
+
+    def _set_prior(self, alpha, beta):
+        self.beta_prior = (alpha, beta)
+        self.aux_beta = (alpha, beta)
 
     def update_aux(self, y):
         self.aux_beta[0] += (y >  0.).sum()

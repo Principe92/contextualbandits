@@ -10,6 +10,47 @@
     #define omp_get_thread_num() (0)
 #endif
 
+void choice_over_rows_cpp
+(
+    double pred[],
+    long outp[],
+    long nrows, long ncols,
+    int nthreads,
+    unsigned int random_seed
+)
+{
+    std::default_random_engine rng(random_seed);
+    std::uniform_real_distribution<double> runif(0., 1.);
+    double sum_row;
+    double rnd;
+    long col;
+    #pragma omp parallel for schedule(static) num_threads(nthreads) \
+            private(sum_row, rnd, col) shared(nrows, ncols, pred, outp)
+    for (long row = 0; row < nrows; row++)
+    {
+        sum_row = 0;
+        for (col = 0; col < ncols; col++)
+            sum_row += pred[col + row*ncols];
+        /* For numerical precision reasons, first standardize the row to sum to 1 */
+        for (col = 0; col < ncols; col++)
+            pred[col + row*ncols] /= sum_row;
+
+        rnd = runif(rng);
+        sum_row = 0;
+        for (col = 0; col < ncols; col++)
+        {
+            sum_row += pred[col + row*ncols];
+            if (sum_row >= rnd)
+            {
+                outp[row] = col;
+                break;
+            }
+        }
+        if (col == ncols-1)
+            outp[row] = col;
+    }
+}
+
 void topN_byrow_cpp
 (
     double scores[],
@@ -100,7 +141,8 @@ void weighted_partial_shuffle
         for (long lev = 0; lev < tree_levels; lev++)
         {
             curr_ix = ix_parent(curr_ix);
-            buffer_arr[curr_ix] -= weights[outp[el]];
+            buffer_arr[curr_ix] =   buffer_arr[ix_child(curr_ix)]
+                                  + buffer_arr[ix_child(curr_ix) + 1];
         }
     }
 
@@ -131,7 +173,7 @@ void topN_softmax_cpp
             std::uniform_int_distribution<unsigned long>(0, ULONG_MAX)(rng_glob)
             );
 
-    long tree_levels = log2ceil(nrow);
+    long tree_levels = log2ceil(ncol);
     std::vector<double> buffer_arr_thread((long)nthreads * pow2(tree_levels + 1));
 
     int tid;
@@ -142,7 +184,7 @@ void topN_softmax_cpp
     {
         tid = omp_get_thread_num();
         weighted_partial_shuffle(
-            outp + row*n, nrow, n, scores + row*ncol,
+            outp + row*n, ncol, n, scores + row*ncol,
             rng_row[row],
             buffer_arr_thread.data() + (long)tid*pow2(tree_levels + 1),
             tree_levels
